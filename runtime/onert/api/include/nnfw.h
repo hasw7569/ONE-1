@@ -61,6 +61,11 @@ extern "C" {
  */
 typedef struct nnfw_session nnfw_session;
 
+/*
+*
+*/
+typedef struct multi_session multi_session;
+
 /**
  * @brief Tensor types
  *
@@ -353,22 +358,20 @@ NNFW_STATUS nnfw_set_input(nnfw_session *session, uint32_t index, NNFW_TYPE type
 NNFW_STATUS nnfw_set_output(nnfw_session *session, uint32_t index, NNFW_TYPE type, void *buffer,
                             size_t length);
 
-NNFW_STATUS pipelining(std::thread *works, std::vector<nnfw_session *> sessions);
-NNFW_STATUS nnfw_set_async_input(nnfw_session *session, uint32_t index, NNFW_TYPE type,
-                                 const void *buffer, size_t length);
-NNFW_STATUS nnfw_set_async_output(nnfw_session *session, uint32_t index, NNFW_TYPE type,
-                                  void *buffer, size_t length);
-NNFW_STATUS nnfw_run_async_execute(nnfw_session *session);
-NNFW_STATUS nnfw_create_new_async_desc(nnfw_session *session);
-NNFW_STATUS nnfw_finish_post(nnfw_session *session);
-NNFW_STATUS nnfw_finish_wait(nnfw_session *session);
-NNFW_STATUS nnfw_deque_post(nnfw_session *session);
-NNFW_STATUS nnfw_deque_wait(nnfw_session *session);
-NNFW_STATUS nnfw_input_post(nnfw_session *session);
-NNFW_STATUS nnfw_input_wait(nnfw_session *session);
-NNFW_STATUS nnfw_set_finish(nnfw_session *session);
-NNFW_STATUS nnfw_get_result(nnfw_session *session, std::vector<void *> outputs);
-NNFW_STATUS nnfw_wait_async_finish(nnfw_session *session);
+NNFW_STATUS nnfw_create_multisession(multi_session **multi_sess);
+NNFW_STATUS nnfw_add_to_multisession(multi_session *multi_sess, const char *package_file_path, const char *backends);
+NNFW_STATUS nnfw_multisession_set_sync_input(multi_session *multi_sess, int session_num, uint32_t index,
+                                        NNFW_TYPE type, const void *buffer, size_t length);
+NNFW_STATUS nnfw_multisession_set_sync_output(multi_session *multi_sess, int session_num, uint32_t index,
+                                         NNFW_TYPE type, void *buffer, size_t length);
+NNFW_STATUS nnfw_multisession_run_sync(multi_session *multi_sess, int session_num);
+NNFW_STATUS nnfw_multisession_set_async_input(multi_session *multi_sess, int session_num, uint32_t index,
+                                              NNFW_TYPE type, const void *buffer, size_t length);
+NNFW_STATUS nnfw_multisession_run_async(multi_session *multi_sess);
+NNFW_STATUS nnfw_multisession_get_result(multi_session *multi_sess, int session_num, std::vector<void *> outputs);
+
+NNFW_STATUS nnfw_multisession_set_finish(multi_session *multi_sess, int session_num); // for debugging
+NNFW_STATUS nnfw_multisession_wait(multi_session *multi_sess, int session_num); // for debugging
 
 /**
  * @brief       Get the number of inputs

@@ -26,17 +26,17 @@ namespace exec
 
 void LinearExecutor::executeImpl()
 {
-  auto profiling_subg_index = _tracing_ctx->getSubgraphIndex(&_graph);
+  // auto profiling_subg_index = _tracing_ctx->getSubgraphIndex(&_graph);
 
-  _subject.notifySubgraphBegin(profiling_subg_index);
+  // _subject.notifySubgraphBegin(profiling_subg_index);
   for (auto &&code : _code)
   {
-    const auto backend = code.lower_info->backend();
+    // const auto backend = code.lower_info->backend();
 // TODO : Move ruy profiler into ExecutionObserver
 #ifdef RUY_PROFILER
     ruy::profiler::ScopeLabel label(code.op->name());
 #endif
-    _subject.notifyJobBegin(this, profiling_subg_index, code.op_ind, backend);
+    // _subject.notifyJobBegin(this, profiling_subg_index, code.op_ind, backend);
 
     auto &fn_seq = code.fn_seq;
 
@@ -47,9 +47,9 @@ void LinearExecutor::executeImpl()
     fn_seq->enableDynamicShapeInferer(handle_dynamic_tensor);
     fn_seq->run();
 
-    _subject.notifyJobEnd(this, profiling_subg_index, code.op_ind, backend);
+    // _subject.notifyJobEnd(this, profiling_subg_index, code.op_ind, backend);
   }
-  _subject.notifySubgraphEnd(profiling_subg_index);
+  // _subject.notifySubgraphEnd(profiling_subg_index);
 }
 
 } // namespace exec

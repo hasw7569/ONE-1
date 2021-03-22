@@ -39,6 +39,7 @@
 #include "util/ConfigSource.h"
 #include "util/logging.h"
 #include "ir/OperationDumper.h"
+#include "ir/OperationCloner.h"
 #include "misc/string_helpers.h"
 
 namespace
@@ -149,8 +150,143 @@ void Compiler::checkProfilerConditions()
     throw std::runtime_error("Profiling mode works only with 'Dataflow' executor");
 }
 
-std::shared_ptr<exec::ExecutorMap> Compiler::compile(void)
+void Compiler::assignPartialGraph(std::unordered_map<ir::SubgraphIndex, ir::OperationIndex> &split_ops)
 {
+  std::cout << "shlee assignParitalGraph1" << std::endl;
+  
+  auto num_partialgraphs = split_ops.size() + 1;
+  auto partialgraphs = std::make_shared<ir::Subgraphs>();
+
+  for (uint32_t idx = 0; idx < num_partialgraphs; idx++)
+  {
+    auto partialgraph = std::make_unique<ir::Graph>();
+    partialgraphs->push(ir::SubgraphIndex{idx}, std::move(partialgraph));
+  }
+  _subgraphs->primary()->setPartialgraphs(partialgraphs);
+
+  auto whole_graph = _subgraphs->at(ir::SubgraphIndex{0});
+  auto partial_graph = whole_graph->partialgraphs();
+
+  _subgraphs->iterate([&](const ir::SubgraphIndex &, ir::Graph &subg) {
+    // Lower: Assign backend
+    auto lowered_graph = std::make_unique<compiler::LoweredGraph>(subg, _options);
+
+    // auto lowered_graph =
+    // std::make_unique<compiler::LoweredGraph>(_subgraphs->at(ir::SubgraphIndex{0}), _options);
+
+    auto whole_op_order = lowered_graph->graph().topolSortOperations();
+    uint32_t subgraph_ind = partial_graph->count() - 1;
+
+    auto iter = split_ops.begin();
+    for (auto op_ind : whole_op_order)
+    {
+     // std::cout << "shlee operation index : " << op_ind.value() << std::endl;
+
+      if (iter == split_ops.end())
+      {
+         //std::cout << "shlee operation index" << (iter->first.value()+1) << std::endl;
+        _options.manual_scheduler_options.index_to_partial[ir::OperationIndex{op_ind.value()}] =
+          ir::SubgraphIndex{subgraph_ind};
+        continue;
+      }
+      else
+      {
+        // std::cout << "shlee operation iter->first : " << iter->first << " iter->second : " << iter->second << std::endl;
+        _options.manual_scheduler_options.index_to_partial[ir::OperationIndex{op_ind.value()}] =
+          iter->first;
+      }
+      if (op_ind == iter->second)
+      {
+        iter++;
+      }
+    }
+  });
+
+  whole_graph->operations().iterate(
+    [&](const ir::OperationIndex &op_ind, const ir::Operation &operation) {
+      auto graph_ind = _options.manual_scheduler_options.index_to_partial.find(op_ind);
+      if (graph_ind == _options.manual_scheduler_options.index_to_partial.end())
+      {
+        std::cout << "shlee operation error" << std::endl;
+      }
+
+      auto part = partial_graph->at(graph_ind->second);
+
+      auto io_list = (operation.getInputs() + operation.getOutputs()) | ir::Remove::DUPLICATED |
+                     ir::Remove::UNDEFINED;
+      for (auto operand_ind : io_list)
+      {
+        if (part->operands().exist(operand_ind))
+          continue;
+
+        // Copy the operand and insert it to the partial graph
+        const auto &operand = whole_graph->operands().at(operand_ind);
+
+        auto new_operand = std::make_unique<ir::Operand>(operand);
+        new_operand->clearDefUse();
+
+        auto new_operand_ind = part->addOperand(operand_ind, std::move(new_operand));
+        UNUSED_RELEASE(new_operand_ind);
+        assert(new_operand_ind == operand_ind);
+      }
+
+      auto new_op_ind = part->addOperation(op_ind, clone(operation));
+      UNUSED_RELEASE(new_op_ind);
+      assert(new_op_ind == op_ind);
+    });
+
+
+  whole_graph->operands().iterate(
+    [&](const ir::OperandIndex &operand_ind, const ir::Operand &operand) {
+      auto uses = operand.getUses();
+
+      for (auto use : uses)
+      {
+        auto graph_ind =
+          _options.manual_scheduler_options.index_to_partial.find(use);
+        if (graph_ind == _options.manual_scheduler_options.index_to_partial.end())
+        {
+          //std::cout << "shlee error :: " << graph_ind->second << std::endl;
+          break;
+        }
+
+        auto part = partial_graph->at(graph_ind->second);
+
+        if (part->operands().exist(operand_ind))
+        {
+          continue;
+        }
+        auto new_operand = std::make_unique<ir::Operand>(operand);
+        new_operand->clearDefUse();
+        // auto &partial_graph = *part;
+        auto new_operand_ind = part->addOperand(operand_ind, std::move(new_operand));
+        UNUSED_RELEASE(new_operand_ind);
+        assert(new_operand_ind == operand_ind);
+      }
+    });
+
+
+
+  for (uint32_t idx = 0; idx < partial_graph->count(); idx++)
+  {
+    auto part = partial_graph->at(ir::SubgraphIndex{idx});
+    //part->finishBuilding();
+    
+    part->operands().iterate([&](const ir::OperandIndex &ind, const ir::Operand &operand) {
+      // Inputs are either "graph input" or "no def op and non-constant"
+      if (whole_graph->getInputs().contains(ind) ||
+          (!operand.getDef().valid() && !operand.isConstant()))
+        // Outputs are either "graph output" or "no uses"
+        part->addInput(ind);
+      if (whole_graph->getOutputs().contains(ind) || operand.getUses().size() == 0)
+        part->addOutput(ind);
+    });
+  }
+}
+
+std::vector<std::shared_ptr<exec::ExecutorMap>> Compiler::compile(void)
+{
+  std::cout << "shlee compile" << std::endl;
   // Set control flow backend for control flow operators
   {
     auto &builtin_id = backend::builtin::Config::ID;
@@ -186,21 +322,38 @@ std::shared_ptr<exec::ExecutorMap> Compiler::compile(void)
                       << std::noboolalpha;
   }
 
-  _subgraphs->iterate([&](const ir::SubgraphIndex &, ir::Graph &subg) {
-    // Mandatory passes
-    pass::PassRunner{}
-      .append(std::make_unique<pass::ConstantOutputPass>(subg))
-      .append(std::make_unique<pass::OddOutputPass>(subg))
-      .run();
+  std::vector<std::shared_ptr<exec::ExecutorMap>> executors;
+  auto executor_map = std::make_shared<exec::ExecutorMap>();
 
-    // Optimizations
-    pass::PassRunner{}.append(std::make_unique<pass::UnusedOperandEliminationPass>(subg)).run();
-  });
+  if (!checkPartitioning())
+  {
+    // Synchronous Run
+    _subgraphs->iterate([&](const ir::SubgraphIndex &, ir::Graph &subg) {
+      // Mandatory passes
+      pass::PassRunner{}
+        .append(std::make_unique<pass::ConstantOutputPass>(subg))
+        .append(std::make_unique<pass::OddOutputPass>(subg))
+        .run();
+    });
+  }
+  else
+  {
+    // Asynchronous Run
+    _subgraphs->iterate([&](const ir::SubgraphIndex &, ir::Graph &subg) {
+      // Mandatory passes
+      auto part = subg.partialgraphs();
+      part->iterate([&](const ir::SubgraphIndex &, ir::Graph &partialgraph) {
+        pass::PassRunner{}
+          .append(std::make_unique<pass::ConstantOutputPass>(partialgraph))
+          .append(std::make_unique<pass::OddOutputPass>(partialgraph))
+          .run();
+      });
+    });
+  }
 
   /***************************************************
    * Prepare compilation phase
    ***************************************************/
-  auto executors = std::make_shared<exec::ExecutorMap>();
 
   // Compilable check
   // TODO: Support hybrid execution -
@@ -208,7 +361,8 @@ std::shared_ptr<exec::ExecutorMap> Compiler::compile(void)
   if (!checkCompilable())
   {
     _subgraphs->iterate([&](const ir::SubgraphIndex &index, ir::Graph &subg) {
-      executors->emplace(index, std::make_unique<interp::InterpExecutor>(subg));
+      executor_map->emplace(index, std::make_unique<interp::InterpExecutor>(subg));
+      executors.push_back(executor_map);
     });
     _state = State::COMPILED;
     return executors;
@@ -223,81 +377,180 @@ std::shared_ptr<exec::ExecutorMap> Compiler::compile(void)
    ***************************************************/
   auto dump_level = static_cast<dumper::dot::DotDumper::Level>(_options.graph_dump_level);
 
-  // Lower: Assign backend
-  std::unordered_map<ir::SubgraphIndex, std::unique_ptr<compiler::LoweredGraph>> lowered_subgs;
-  _subgraphs->iterate([&](const ir::SubgraphIndex &index, ir::Graph &subg) {
-    onert::dumper::dot::DotDumper dot_dumper(subg, dump_level);
-    dot_dumper.dump(nnfw::misc::str("before_lower_subg-", index.value()));
-
+  if (!checkPartitioning())
+  {
     // Lower: Assign backend
-    lowered_subgs[index] = std::make_unique<compiler::LoweredGraph>(subg, _options);
+    std::unordered_map<ir::SubgraphIndex, std::unique_ptr<compiler::LoweredGraph>> lowered_subgs;
+    _subgraphs->iterate([&](const ir::SubgraphIndex &index, ir::Graph &subg) {
+      onert::dumper::dot::DotDumper dot_dumper(subg, dump_level);
+      dot_dumper.dump(nnfw::misc::str("before_lower_subg-", index.value()));
 
-    subg.setSubgraphs(nullptr);
-  });
+      // Lower: Assign backend
+      lowered_subgs[index] = std::make_unique<compiler::LoweredGraph>(subg, _options);
 
-  _subgraphs.reset();
+      subg.setSubgraphs(nullptr);
+    });
 
-  for (auto &pair : lowered_subgs)
-  {
-    const auto &subg_index = pair.first;
-    auto &lowered_subg = pair.second;
-    onert::dumper::dot::DotDumper dot_dumper_lowered(lowered_subg.get(), dump_level);
-    dot_dumper_lowered.dump("after_lower_subg-" + std::to_string(subg_index.value()));
-  }
+    _subgraphs.reset();
 
-  // Shape inference.
-  {
-    const auto primary_subg_idx = ir::SubgraphIndex{0};
-    StaticShapeInferer inferer(primary_subg_idx, lowered_subgs);
-    auto &lowered_subg = lowered_subgs.at(primary_subg_idx);
-    auto ordered_ops = lowered_subg->graph().topolSortOperations();
-    for (auto op_ind : ordered_ops)
+    for (auto &pair : lowered_subgs)
     {
-      const auto &op = lowered_subg->graph().operations().at(op_ind);
-      bool has_dynamic_tensor = inferer.infer(op);
-      lowered_subg->setHasDynamicTensor(op_ind, has_dynamic_tensor);
+      const auto &subg_index = pair.first;
+      auto &lowered_subg = pair.second;
+      onert::dumper::dot::DotDumper dot_dumper_lowered(lowered_subg.get(), dump_level);
+      dot_dumper_lowered.dump("after_lower_subg-" + std::to_string(subg_index.value()));
     }
-    inferer.dump();
+
+    // for (auto &pair : lowered_partialgraphs)
+    // {
+    //   const auto &partialgraph_index = pair.first;
+    //   auto &lowered_partialgraph = pair.second;
+    //   onert::dumper::dot::DotDumper dot_dumper_lowered_part(lowered_partialgraph.get(),
+    //   dump_level); dot_dumper_lowered_part.dump("after_lower_partialgraph-" +
+    //   std::to_string(partialgraph_index.value()));
+    // }
+
+    // Shape inference.
+    {
+      const auto primary_subg_idx = ir::SubgraphIndex{0};
+      StaticShapeInferer inferer(primary_subg_idx, lowered_subgs);
+      auto &lowered_subg = lowered_subgs.at(primary_subg_idx);
+      auto ordered_ops = lowered_subg->graph().topolSortOperations();
+      for (auto op_ind : ordered_ops)
+      {
+        // std::cout << "shlee shape inference : " << op_ind.value() << std::endl;
+        const auto &op = lowered_subg->graph().operations().at(op_ind);
+        bool has_dynamic_tensor = inferer.infer(op);
+        lowered_subg->setHasDynamicTensor(op_ind, has_dynamic_tensor);
+      }
+      inferer.dump();
+    }
+
+    // Shape validation
+    // TODO Move shape independent feature check from ShapeValidator to OperationValidator
+    // TODO Move ShapeValidator into shape inference
+    //      - Check input tensor shape validation
+    //      - Check parameter value validation which valid value is depend on input tensor shape
+    //      - Output tensor shape validation check is needless because
+    //        static/dynamic shape inferer will make valid output shape
+    for (auto &pair : lowered_subgs)
+    {
+      auto &lowered_subg = pair.second;
+      compiler::ShapeValidator{lowered_subg->graph()}();
+    }
+
+    /*************************************************************
+     *  Backend independent analysis & optimization phase finished
+     *************************************************************/
+
+    executor_map = std::make_shared<exec::ExecutorMap>();
+    for (auto &pair : lowered_subgs)
+    {
+      const auto &subg_index = pair.first;
+      auto &lowered_subg = pair.second;
+      auto indexed_ranks = lowered_subg->indexed_ranks();
+
+      ir::OperationDumper dumper("Executor generation of Subgraph " +
+                                 std::to_string(subg_index.value()));
+      lowered_subg->graph().operations().iterate(
+        [&](const ir::OperationIndex &, const ir::Operation &op) { op.accept(dumper); });
+      auto executor = std::unique_ptr<exec::IExecutor>{
+        ExecutorFactory::get().create(std::move(lowered_subg), _options, executor_map)};
+      executor->setIndexedRanks(indexed_ranks);
+      executor_map->insert(std::make_pair(subg_index, std::move(executor)));
+      executors.push_back(executor_map);
+    }
+    
   }
-
-  // Shape validation
-  // TODO Move shape independent feature check from ShapeValidator to OperationValidator
-  // TODO Move ShapeValidator into shape inference
-  //      - Check input tensor shape validation
-  //      - Check parameter value validation which valid value is depend on input tensor shape
-  //      - Output tensor shape validation check is needless because
-  //        static/dynamic shape inferer will make valid output shape
-  for (auto &pair : lowered_subgs)
+  else
   {
-    auto &lowered_subg = pair.second;
-    compiler::ShapeValidator{lowered_subg->graph()}();
-  }
+    // Lower: Assign backend
+    std::unordered_map<ir::SubgraphIndex, std::unique_ptr<compiler::LoweredGraph>>
+      lowered_partialgraphs;
+    _subgraphs->iterate([&](const ir::SubgraphIndex &, ir::Graph &subg) {
+      auto part = subg.partialgraphs();
+      std::cout << "shlee part count " << part->count() << std::endl;
+      part->iterate([&](const ir::SubgraphIndex &pindex, ir::Graph &partialgraph) {
+        onert::dumper::dot::DotDumper dot_dumper_part(partialgraph, dump_level);
+        dot_dumper_part.dump(nnfw::misc::str("before_lower_subg_partialgraph-", pindex.value()));
 
-  /*************************************************************
-   *  Backend independent analysis & optimization phase finished
-   *************************************************************/
+        // // Lower: Assign backend
+        lowered_partialgraphs[pindex] =
+          std::make_unique<compiler::LoweredGraph>(partialgraph, _options);
+        partialgraph.setSubgraphs(nullptr);
+      });
+    });
 
-  executors = std::make_shared<exec::ExecutorMap>();
-  for (auto &pair : lowered_subgs)
-  {
-    const auto &subg_index = pair.first;
-    auto &lowered_subg = pair.second;
-    auto indexed_ranks = lowered_subg->indexed_ranks();
+    _subgraphs.reset();
 
-    ir::OperationDumper dumper("Executor generation of Subgraph " +
-                               std::to_string(subg_index.value()));
-    lowered_subg->graph().operations().iterate(
-      [&](const ir::OperationIndex &, const ir::Operation &op) { op.accept(dumper); });
-    auto executor = std::unique_ptr<exec::IExecutor>{
-      ExecutorFactory::get().create(std::move(lowered_subg), _options, executors)};
-    executor->setIndexedRanks(indexed_ranks);
-    executors->insert(std::make_pair(subg_index, std::move(executor)));
+    for (auto &pair : lowered_partialgraphs)
+    {
+      const auto &partialgraph_index = pair.first;
+      auto &lowered_partialgraph = pair.second;
+      onert::dumper::dot::DotDumper dot_dumper_lowered_part(lowered_partialgraph.get(), dump_level);
+      dot_dumper_lowered_part.dump("after_lower_subg_partialgraph-" +
+                                   std::to_string(partialgraph_index.value()));
+    }
+
+    // Partial Graph shape inference
+    for (auto &pair : lowered_partialgraphs)
+    {
+      const auto &partialgraph_index = pair.first;
+      auto &lowered_partialgraph = pair.second;
+      StaticShapeInferer partial_inferer(partialgraph_index, lowered_partialgraphs);
+      auto ordered_ops = lowered_partialgraph->graph().topolSortOperations();
+      for (auto op_ind : ordered_ops)
+      {
+        const auto &op = lowered_partialgraph->graph().operations().at(op_ind);
+        bool has_dynamic_tensor = partial_inferer.infer(op);
+        lowered_partialgraph->setHasDynamicTensor(op_ind, has_dynamic_tensor);
+      }
+      partial_inferer.dump();
+    }
+
+    // Shape validation
+    // TODO Move shape independent feature check from ShapeValidator to OperationValidator
+    // TODO Move ShapeValidator into shape inference
+    //      - Check input tensor shape validation
+    //      - Check parameter value validation which valid value is depend on input tensor shape
+    //      - Output tensor shape validation check is needless because
+    //        static/dynamic shape inferer will make valid output shape
+    for (auto &pair : lowered_partialgraphs)
+    {
+      auto &lowered_partialgraph = pair.second;
+      compiler::ShapeValidator{lowered_partialgraph->graph()}();
+    }
+
+    /*************************************************************
+     *  Backend independent analysis & optimization phase finished
+     *************************************************************/
+
+    for (auto &pair : lowered_partialgraphs)
+    {
+      executor_map = std::make_shared<exec::ExecutorMap>();
+      const auto &partialgraph_index = pair.first;
+      auto &lowered_partialgraph = pair.second;
+      auto indexed_ranks = lowered_partialgraph->indexed_ranks();
+
+      std::cout << "partial graph index : " << partialgraph_index << std::endl;
+      ir::OperationDumper dumper("Executor generation of Subgraph " +
+                                 std::to_string(partialgraph_index.value()));
+      lowered_partialgraph->graph().operations().iterate(
+        [&](const ir::OperationIndex &, const ir::Operation &op) { op.accept(dumper); });
+      auto executor = std::unique_ptr<exec::IExecutor>{ExecutorFactory::get().create(
+        std::move(lowered_partialgraph), _options, executor_map)};
+      executor->setIndexedRanks(indexed_ranks);
+      executor_map->insert(std::make_pair(ir::SubgraphIndex{0}, std::move(executor)));
+      executors.push_back(executor_map);
+    }
   }
 
   /********************************
    * Code generation phase finished
    ********************************/
   _state = State::COMPILED;
+  std::cout << "shlee prepare finish" << std::endl;
+
   return executors;
 }
 
@@ -325,6 +578,29 @@ bool Compiler::checkCompilable()
   }
 
   return true;
+}
+
+bool Compiler::checkPartitioning()
+{
+  bool b = true;
+  std::cout << "shlee checkPartitioning : " << b << std::endl;
+
+  return b;
+}
+
+void Compiler::compile_partial(void)
+{
+ if(!checkPartitioning()) return;
+
+  std::unordered_map<ir::SubgraphIndex, ir::OperationIndex> split_ops = { 
+    {ir::SubgraphIndex{0}, ir::OperationIndex{110}},
+    //{ir::SubgraphIndex{1}, ir::OperationIndex{215}},
+    };
+
+  //split_ops.push_back(ir::SubgraphIndex{0}, ir::OperationIndex{110});
+  //split_ops.push_back(ir::SubgraphIndex{1}, ir::OperationIndex{215});
+
+  assignPartialGraph(split_ops);
 }
 
 } // namespace compiler

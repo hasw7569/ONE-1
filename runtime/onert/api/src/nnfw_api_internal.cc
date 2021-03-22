@@ -158,7 +158,7 @@ void setConfigKeyValues(const CfgKeyValues &keyValues)
 } // namespace
 
 nnfw_session::nnfw_session()
-  : _subgraphs{nullptr}, _execution{nullptr}, _next_session{nullptr},
+  : _subgraphs{nullptr}, _next_session{nullptr},
     _kernel_registry{std::make_shared<onert::frontend::custom::KernelRegistry>()}, _tracing_ctx{
                                                                                      nullptr}
 {
@@ -349,8 +349,14 @@ NNFW_STATUS nnfw_session::prepare()
   try
   {
     _subgraphs.reset();
-    std::shared_ptr<onert::exec::ExecutorMap> executors = _compiler->compile();
-    _execution = std::make_unique<onert::exec::Execution>(executors);
+
+    _compiler->compile_partial();
+    std::vector<std::shared_ptr<onert::exec::ExecutorMap>> executors = _compiler->compile();
+
+    for (auto it = executors.begin(); it != executors.end(); ++it)
+    {
+      _execution.push_back(std::make_unique<onert::exec::Execution>(*it));
+    }
   }
   catch (const std::exception &e)
   {
@@ -371,9 +377,17 @@ NNFW_STATUS nnfw_session::run()
     return NNFW_STATUS_INVALID_STATE;
   }
 
+  if (_execution.size() > 1)
+  {
+    std::cerr << "Error during nnfw_session::run : "
+              << "it should be only one execution" << std::endl;
+    return NNFW_STATUS_ERROR;
+  }
+
   try
   {
-    _execution->execute();
+    auto execution = _execution.begin();
+    (*execution)->execute();
   }
   catch (const onert::InsufficientBufferSizeException &e)
   {
@@ -400,7 +414,15 @@ NNFW_STATUS nnfw_session::run_async()
     return NNFW_STATUS_INVALID_STATE;
   }
 
-  _execution->startExecute();
+  if (_execution.size() > 1)
+  {
+    std::cerr << "Error during nnfw_session::run_async : "
+              << "it should be only one execution" << std::endl;
+    return NNFW_STATUS_ERROR;
+  }
+  
+  auto execution = _execution.begin();
+  (*execution)->startExecute();
 
   _state = State::RUNNING;
   return NNFW_STATUS_NO_ERROR;
@@ -415,7 +437,15 @@ NNFW_STATUS nnfw_session::await()
     return NNFW_STATUS_ERROR;
   }
 
-  _execution->waitFinish();
+  if (_execution.size() > 1)
+  {
+    std::cerr << "Error during nnfw_session::await : "
+              << "it should be only one execution" << std::endl;
+    return NNFW_STATUS_ERROR;
+  }
+
+  auto execution = _execution.begin();
+  (*execution)->waitFinish();
 
   _state = State::FINISHED_RUN;
   return NNFW_STATUS_NO_ERROR;
@@ -438,9 +468,17 @@ NNFW_STATUS nnfw_session::set_input(uint32_t index, NNFW_TYPE /*type*/, const vo
     return NNFW_STATUS_ERROR;
   }
 
+  if (_execution.size() > 1)
+  {
+    std::cerr << "Error during nnfw_session::set_input : "
+              << "it should be only one execution" << std::endl;
+    return NNFW_STATUS_ERROR;
+  }
+
   try
   {
-    _execution->setInput(onert::ir::IOIndex(index), buffer, length);
+    auto execution = _execution.begin();
+    (*execution)->setInput(onert::ir::IOIndex(index), buffer, length);
   }
   catch (const std::exception &e)
   {
@@ -467,9 +505,17 @@ NNFW_STATUS nnfw_session::set_output(uint32_t index, NNFW_TYPE /*type*/, void *b
     return NNFW_STATUS_ERROR;
   }
 
+  if (_execution.size() > 1)
+  {
+    std::cerr << "Error during nnfw_session::set_output : "
+              << "it should be only one execution" << std::endl;
+    return NNFW_STATUS_ERROR;
+  }
+
   try
   {
-    _execution->setOutput(onert::ir::IOIndex(index), buffer, length);
+    auto execution = _execution.begin();
+    (*execution)->setOutput(onert::ir::IOIndex(index), buffer, length);
   }
   catch (const std::exception &e)
   {
@@ -479,59 +525,105 @@ NNFW_STATUS nnfw_session::set_output(uint32_t index, NNFW_TYPE /*type*/, void *b
   return NNFW_STATUS_NO_ERROR;
 }
 
-NNFW_STATUS nnfw_session::run_async_execute()
+NNFW_STATUS nnfw_session::run_pipelining()
 {
-  try
+  std::thread *work = new std::thread[_execution.size()];
+  for (uint32_t idx = 0; idx < _execution.size(); idx++)
   {
-    _execution->Async_execute();
+    work[idx] = std::thread([](std::vector<std::unique_ptr<onert::exec::Execution>> *_executions, uint32_t exe_id, nnfw_session* next) {
 
-    onert::exec::IODescription* _async_io_desc = _execution->get_async_io_desc();
-    if (_next_session != nullptr) {
-      _next_session->create_new_async_desc();
-      nnfw_tensorinfo ti;
-      for (size_t i = 0; i < _async_io_desc->outputs.size(); i++) {
-        _next_session->input_tensorinfo(i, &ti);
-        _next_session->set_async_input(i, ti.dtype, _async_io_desc->outputs[i]->buffer, _async_io_desc->outputs[i]->size);
+      auto datatype_to_nnfw_dtype = [](onert::ir::DataType dt) {
+        using onert::ir::DataType;
+        switch (dt) {
+          case DataType::FLOAT32:
+          return NNFW_TYPE_TENSOR_FLOAT32;
+          case DataType::INT32:
+          return NNFW_TYPE_TENSOR_INT32;
+          case DataType::QUANT_UINT8_ASYMM:
+          return NNFW_TYPE_TENSOR_QUANT8_ASYMM;
+          case DataType::BOOL8:
+          return NNFW_TYPE_TENSOR_BOOL;
+          case DataType::UINT8:
+          return NNFW_TYPE_TENSOR_UINT8;
+          case DataType::INT64:
+          return NNFW_TYPE_TENSOR_INT64;
+          case DataType::QUANT_INT8_ASYMM:
+          return NNFW_TYPE_TENSOR_QUANT8_ASYMM_SIGNED;
+          case DataType::UINT32:
+          case DataType::QUANT_INT8_SYMM:
+          default:
+          throw std::runtime_error("Error: Model has type that runtime API does not support.");
+        }
+      };
+
+      uint32_t sz = (*_executions)[exe_id]->primary_subgraph().getOutputs().size();
+      while (true)
+      {
+        if ((*_executions)[exe_id]->is_empty_queue() && (*_executions)[exe_id]->isFinished()) {
+          if (exe_id < (*_executions).size() -1) {
+            (*_executions)[exe_id + 1]->set_finish();
+          }
+          else if (next != NULL) {
+            next->async_set_finish(0);
+          }
+          break;
+        }
+
+        if ((*_executions)[exe_id]->is_empty_queue() == false) {
+          (*_executions)[exe_id]->input_wait();
+
+          for (uint32_t i = 0; i < sz; i++) {
+            auto opidx = (*_executions)[exe_id]->primary_subgraph().getOutputs().at(i);
+            auto shape = (*_executions)[exe_id]->primary_subgraph().operands().at(opidx).shape();
+            auto dtype = datatype_to_nnfw_dtype((*_executions)[exe_id]->primary_subgraph().operands().at(opidx).typeInfo().type());
+            auto rank = shape.rank();
+            uint32_t tensor_size = 1;
+            for (int32_t j = 0; j < rank; j++) {
+              tensor_size *= shape.dim(j);
+            }
+            if (dtype == NNFW_TYPE_TENSOR_INT32 || dtype == NNFW_TYPE_TENSOR_FLOAT32) tensor_size *= 4;
+            else if (dtype == NNFW_TYPE_TENSOR_INT64) tensor_size *= 8;
+            void *buffer = (void *)malloc(tensor_size);
+            (*_executions)[exe_id]->setAsyncOutput(onert::ir::IOIndex(i), buffer, tensor_size);
+          }
+          (*_executions)[exe_id]->Async_execute();
+
+          onert::exec::IODescription* _async_io_desc = (*_executions)[exe_id]->get_async_io_desc();
+          if (exe_id < (*_executions).size() - 1) {
+            (*_executions)[exe_id + 1]->CreateNewAsyncDesc();
+            for (size_t i = 0; i < _async_io_desc->outputs.size(); i++)
+            {
+              (*_executions)[exe_id + 1]->setAsyncInput(onert::ir::IOIndex(i), _async_io_desc->outputs[i]->buffer, _async_io_desc->outputs[i]->size);
+            }
+            (*_executions)[exe_id + 1]->input_post();
+            delete _async_io_desc;
+          }
+          else {
+            if (next != NULL) {
+              next->create_new_async_desc(0);
+              nnfw_tensorinfo ti;
+              for (size_t i = 0; i < _async_io_desc->outputs.size(); i++)
+              {
+                next->input_tensorinfo(i, &ti);
+                next->set_async_input(i, ti.dtype, _async_io_desc->outputs[i]->buffer, _async_io_desc->outputs[i]->size, 0);
+              }
+              next->async_input_post(0);
+              delete _async_io_desc;
+            }
+            else {
+              (*_executions)[exe_id]->push_async_result(_async_io_desc);
+            }
+          }
+        }
       }
-      nnfw_input_post(_next_session);
-      delete _async_io_desc;
-    }
-    else {
-      _execution->push_async_result(_async_io_desc);
-    }
+      (*_executions)[exe_id]->finish_post();
+    }, &_execution, idx, _next_session);
   }
-  catch (const onert::InsufficientBufferSizeException &e)
-  {
-    // Currently insufficient buffer always means output buffer.
-    std::cerr << "Error during nnfw_session::run_async_execute : " << e.what() << std::endl;
-    return NNFW_STATUS_INSUFFICIENT_OUTPUT_SIZE;
-  }
-  catch (const std::exception &e)
-  {
-    std::cerr << "Error during nnfw_session::run_async_execute : " << e.what() << std::endl;
-    return NNFW_STATUS_ERROR;
-  }
-
-  return NNFW_STATUS_NO_ERROR;
-}
-
-NNFW_STATUS nnfw_session::wait_async_finish()
-{
-  if (_execution->isFinished() && _execution->is_empty_queue()) {
-    _state = State::FINISHED_RUN;
-    return NNFW_STATUS_NO_ERROR;
-  }
-  return NNFW_STATUS_ERROR;
-}
-
-NNFW_STATUS nnfw_session::check_empty_queue()
-{
-  if (_execution->is_empty_queue()) return NNFW_STATUS_ERROR;
   return NNFW_STATUS_NO_ERROR;
 }
 
 NNFW_STATUS nnfw_session::set_async_input(uint32_t index, NNFW_TYPE /*type*/, const void *buffer,
-                                          size_t length)
+                                          size_t length, uint32_t exe_id)
 {
   if (!isStatePreparedOrFinishedRun())
   {
@@ -549,7 +641,7 @@ NNFW_STATUS nnfw_session::set_async_input(uint32_t index, NNFW_TYPE /*type*/, co
 
   try
   {
-    _execution->setAsyncInput(onert::ir::IOIndex(index), buffer, length);
+    _execution[exe_id]->setAsyncInput(onert::ir::IOIndex(index), buffer, length);
   }
   catch (const std::exception &e)
   {
@@ -559,38 +651,9 @@ NNFW_STATUS nnfw_session::set_async_input(uint32_t index, NNFW_TYPE /*type*/, co
   return NNFW_STATUS_NO_ERROR;
 }
 
-NNFW_STATUS nnfw_session::set_async_output(uint32_t index, NNFW_TYPE /*type*/, void *buffer,
-                                           size_t length)
+NNFW_STATUS nnfw_session::create_new_async_desc(uint32_t index)
 {
-  if (!isStatePreparedOrFinishedRun())
-  {
-    std::cerr << "Error during nnfw_session::set_output : invalid state" << std::endl;
-    return NNFW_STATUS_INVALID_STATE;
-  }
-
-  if (!buffer && length != 0)
-  {
-    std::cerr
-      << "Error during nnfw_session::set_output : given buffer is NULL but the length is not 0"
-      << std::endl;
-    return NNFW_STATUS_ERROR;
-  }
-
-  try
-  {
-    _execution->setAsyncOutput(onert::ir::IOIndex(index), buffer, length);
-  }
-  catch (const std::exception &e)
-  {
-    std::cerr << "Error during nnfw_session::set_output : " << e.what() << std::endl;
-    return NNFW_STATUS_ERROR;
-  }
-  return NNFW_STATUS_NO_ERROR;
-}
-
-NNFW_STATUS nnfw_session::create_new_async_desc()
-{
-  _execution->CreateNewAsyncDesc();
+  _execution[index]->CreateNewAsyncDesc();
   return NNFW_STATUS_NO_ERROR;
 }
 
@@ -600,57 +663,37 @@ NNFW_STATUS nnfw_session::set_next_session(nnfw_session *session)
   return NNFW_STATUS_NO_ERROR;
 }
 
-NNFW_STATUS nnfw_session::async_finish_post()
+NNFW_STATUS nnfw_session::async_input_post(uint32_t exe_id)
 {
-  _execution->finish_post();
+  _execution[exe_id]->input_post();
   return NNFW_STATUS_NO_ERROR;
 }
 
-NNFW_STATUS nnfw_session::async_finish_wait()
+NNFW_STATUS nnfw_session::async_input_wait(uint32_t exe_id)
 {
-  _execution->finish_wait();
-  return NNFW_STATUS_NO_ERROR;
-}
-
-NNFW_STATUS nnfw_session::async_deque_post()
-{
-  _execution->deque_post();
-  return NNFW_STATUS_NO_ERROR;
-}
-
-NNFW_STATUS nnfw_session::async_deque_wait()
-{
-  _execution->deque_wait();
-  return NNFW_STATUS_NO_ERROR;
-}
-
-NNFW_STATUS nnfw_session::async_input_post()
-{
-  _execution->input_post();
-  return NNFW_STATUS_NO_ERROR;
-}
-
-NNFW_STATUS nnfw_session::async_input_wait()
-{
-  _execution->input_wait();
-  return NNFW_STATUS_NO_ERROR;
-}
-
-NNFW_STATUS nnfw_session::async_set_finish()
-{
-  _execution->set_finish();
+  _execution[exe_id]->input_wait();
   return NNFW_STATUS_NO_ERROR;
 }
 
 NNFW_STATUS nnfw_session::async_get_result(std::vector<void *> outputs)
 {
-  _execution->get_result(outputs);
+  _execution[_execution.size() - 1]->get_result(outputs);
   return NNFW_STATUS_NO_ERROR;
 }
 
-nnfw_session* nnfw_session::get_next_session()
+NNFW_STATUS nnfw_session::async_set_finish(uint32_t exe_id)
 {
-  return _next_session;
+  _execution[exe_id]->set_finish();
+  return NNFW_STATUS_NO_ERROR;
+}
+
+NNFW_STATUS nnfw_session::async_wait()
+{
+  for (size_t exe_id = 0; exe_id < _execution.size(); exe_id++)
+  {
+    _execution[exe_id]->finish_wait();
+  }
+  return NNFW_STATUS_NO_ERROR;
 }
 
 NNFW_STATUS nnfw_session::input_size(uint32_t *number)
@@ -707,7 +750,10 @@ NNFW_STATUS nnfw_session::set_input_layout(uint32_t index, NNFW_LAYOUT layout)
       std::cerr << "Error during nnfw_session::set_input_layout, not supported layout" << std::endl;
       return NNFW_STATUS_ERROR;
     }
-    _execution->setInputLayout(onert::ir::IOIndex(index), convertLayout(layout));
+    for (auto it = _execution.begin(); it != _execution.end(); ++it)
+    {
+      (*it)->setInputLayout(onert::ir::IOIndex(index), convertLayout(layout));
+    }
   }
   catch (const std::exception &e)
   {
@@ -728,7 +774,10 @@ NNFW_STATUS nnfw_session::set_output_layout(uint32_t index, NNFW_LAYOUT layout)
                 << std::endl;
       return NNFW_STATUS_ERROR;
     }
-    _execution->setOutputLayout(onert::ir::IOIndex(index), convertLayout(layout));
+    for (auto it = _execution.begin(); it != _execution.end(); ++it)
+    {
+      (*it)->setOutputLayout(onert::ir::IOIndex(index), convertLayout(layout));
+    }
   }
   catch (const std::exception &e)
   {
@@ -808,7 +857,10 @@ NNFW_STATUS nnfw_session::apply_tensorinfo(uint32_t index, nnfw_tensorinfo ti)
   }
   else // when called after nnfw_session::prepare()
   {
-    _execution->changeInputShape(onert::ir::IOIndex(index), new_shape);
+    for (auto it = _execution.begin(); it != _execution.end(); ++it)
+    {
+      (*it)->changeInputShape(onert::ir::IOIndex(index), new_shape);
+    }
   }
 
   return NNFW_STATUS_NO_ERROR;
@@ -842,7 +894,7 @@ NNFW_STATUS nnfw_session::input_tensorinfo(uint32_t index, nnfw_tensorinfo *ti)
     auto opidx = primary_subgraph()->getInputs().at(index);
     auto shape = primary_subgraph()->operands().at(opidx).shape();
     if (isStatePreparedOrFinishedRun())
-      shape = _execution->getInputShape(onert::ir::IOIndex{index});
+      shape = (*_execution.begin())->getInputShape(onert::ir::IOIndex{index});
     ti->rank = shape.rank();
     for (int j = 0; j < ti->rank; ++j)
     {
@@ -883,7 +935,7 @@ NNFW_STATUS nnfw_session::output_tensorinfo(uint32_t index, nnfw_tensorinfo *ti)
     auto shape = primary_subgraph()->operands().at(opidx).shape();
     // If it is called after `nnfw_run` then get the shape from Execution, not from the graph
     if (isStateFinishedRun())
-      shape = _execution->getOutputShape(onert::ir::IOIndex{index});
+      shape = (*_execution.begin())->getOutputShape(onert::ir::IOIndex{index});
     ti->rank = shape.rank();
     for (int j = 0; j < ti->rank; ++j)
     {
@@ -1039,15 +1091,15 @@ const onert::ir::Graph *nnfw_session::primary_subgraph()
 {
   if (_subgraphs)
   {
-    assert(!_execution);
+    assert(!(*_execution.begin()));
     return _subgraphs->primary().get();
   }
   else
   {
-    assert(_execution);
+    assert(*_execution.begin());
     // TODO Remove const_cast
     // We assumed the graph will not change after compilation, but shape could change
-    return &_execution->primary_subgraph();
+    return &(*_execution.begin())->primary_subgraph();
   }
 }
 
@@ -1105,7 +1157,7 @@ bool nnfw_session::isStateInitialized()
   {
     assert(!_subgraphs);
     assert(!_compiler);
-    assert(!_execution);
+    assert(!(*_execution.begin()));
     return true;
   }
   else
@@ -1120,7 +1172,7 @@ bool nnfw_session::isStateModelLoaded()
   {
     assert(_subgraphs);
     assert(_compiler);
-    assert(!_execution);
+    assert(!(*_execution.begin()));
     return true;
   }
   else
@@ -1135,7 +1187,7 @@ bool nnfw_session::isStatePrepared()
   {
     assert(!_subgraphs);
     assert(_compiler);
-    assert(_execution);
+    assert(*_execution.begin());
     return true;
   }
   else
@@ -1150,7 +1202,7 @@ bool nnfw_session::isStateRunning()
   {
     assert(!_subgraphs);
     assert(_compiler);
-    assert(_execution);
+    assert(*_execution.begin());
     return true;
   }
   return false;
@@ -1162,7 +1214,7 @@ bool nnfw_session::isStateFinishedRun()
   {
     assert(!_subgraphs);
     assert(_compiler);
-    assert(_execution);
+    assert(*_execution.begin());
     return true;
   }
   else

@@ -79,15 +79,16 @@ public:
   void setAsyncOutput(const ir::IOIndex &index, void *buffer, size_t length,
                       ir::Layout layout = ir::Layout::NHWC);
   void Async_execute();
-  void finish_post();
-  void finish_wait();
   void deque_post();
   void deque_wait();
   void input_post();
   void input_wait();
-  void set_finish();
-  bool is_empty_queue();
   void get_result(std::vector<void *> outputs);
+
+  void set_finish(); // for debugging
+  bool is_empty_queue(); // for debugging
+  void finish_post(); // for debugging
+  void finish_wait(); // for debugging
 
   IODescription* get_async_io_desc();
   void push_async_result(IODescription* io_desc);
@@ -177,9 +178,9 @@ private:
   IODescription _io_desc;
   std::deque<IODescription *> _async_io_descs;
   std::deque<IODescription *> _async_result;
-  sem_t _async_finish;
   sem_t _async_input_sem;
   sem_t _deque;
+  sem_t _async_finish;
   std::unique_ptr<std::thread> _exec_thread;
   bool finished{false};
 };

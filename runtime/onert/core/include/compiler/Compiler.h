@@ -43,6 +43,7 @@ struct ManualSchedulerOptions
   std::string backend_for_all;
   std::unordered_map<ir::OpCode, std::string> opcode_to_backend;
   std::unordered_map<ir::OperationIndex, std::string> index_to_backend;
+  std::unordered_map<ir::OperationIndex, ir::SubgraphIndex> index_to_partial;
 };
 
 struct CompilerOptions
@@ -84,7 +85,7 @@ public:
    *
    * @return std::shared_ptr<exec::ExecutorMap> Executors as a result of compilation
    */
-  std::shared_ptr<exec::ExecutorMap> compile(void);
+  std::vector<std::shared_ptr<exec::ExecutorMap>> compile(void);
 
   State state(void) const { return _state; }
 
@@ -102,8 +103,12 @@ public:
    */
   void enableToFp16();
 
+  void assignPartialGraph(std::unordered_map<ir::SubgraphIndex, ir::OperationIndex> &split_ops);
+  void compile_partial(void);
+
 private:
   void checkProfilerConditions();
+  bool checkPartitioning();
   std::shared_ptr<ir::Graph> &primary_subgraph() { return _subgraphs->at(ir::SubgraphIndex{0}); }
 
 private:

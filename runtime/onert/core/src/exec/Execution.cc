@@ -31,9 +31,9 @@ Execution::Execution(const std::shared_ptr<ExecutorMap> &executors) : _executors
   _io_desc.inputs.resize(primary_subg.getInputs().size());
   _io_desc.outputs.resize(primary_subg.getOutputs().size());
 
-  sem_init(&_async_finish, 0, 0);
   sem_init(&_deque, 0, 1);
   sem_init(&_async_input_sem, 0, 0);
+  sem_init(&_async_finish, 0, 0);
 }
 
 void Execution::changeInputShape(const ir::IOIndex &index, const ir::Shape &new_shape)
@@ -77,6 +77,8 @@ void Execution::setInput(const ir::IOIndex &index, const void *buffer, size_t le
 
 void Execution::CreateNewAsyncDesc()
 {
+  if (_async_io_descs.size() >= 20) return;
+
   IODescription *_async_io_desc = new IODescription;
   _async_io_desc->inputs.resize(primary_subgraph().getInputs().size());
   _async_io_desc->outputs.resize(primary_subgraph().getOutputs().size());
@@ -84,16 +86,6 @@ void Execution::CreateNewAsyncDesc()
   deque_wait();
   _async_io_descs.push_back(_async_io_desc);
   deque_post();
-}
-
-void Execution::finish_post()
-{
-  sem_post(&_async_finish);
-}
-
-void Execution::finish_wait()
-{
-  sem_wait(&_async_finish);
 }
 
 void Execution::deque_post()
@@ -116,11 +108,6 @@ void Execution::input_wait()
   sem_wait(&_async_input_sem);
 }
 
-void Execution::set_finish()
-{
-  finished = true;
-}
-
 IODescription* Execution::get_async_io_desc()
 {
   deque_wait();
@@ -136,19 +123,35 @@ void Execution::push_async_result(IODescription* io_desc)
   _async_result.push_back(io_desc);
 }
 
-bool Execution::is_empty_queue()
-{
-  return _async_io_descs.empty();
-}
-
 void Execution::get_result(std::vector<void *> outputs)
 {
+  if (_async_result.empty()) return;
   IODescription* ret = _async_result.front();
   _async_result.pop_front();
   for (uint i = 0; i < ret->outputs.size(); i++) {
     memcpy(outputs[i], ret->outputs[i]->buffer, ret->outputs[i]->size);
   }
   free(ret);
+}
+
+void Execution::set_finish()
+{
+  finished = true;
+}
+
+bool Execution::is_empty_queue()
+{
+  return _async_io_descs.empty();
+}
+
+void Execution::finish_post()
+{
+  sem_post(&_async_finish);
+}
+
+void Execution::finish_wait()
+{
+  sem_wait(&_async_finish);
 }
 
 void Execution::setAsyncInput(const ir::IOIndex &index, const void *buffer, size_t length,

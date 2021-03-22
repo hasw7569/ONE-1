@@ -88,6 +88,7 @@ public:
   void removeOperand(const OperandIndex &ind) { _operands.remove(ind); }
   void setLayout(Layout layout) { _layout = layout; }
   void setSubgraphs(const std::shared_ptr<Subgraphs> &subgs) { _subgraphs = subgs; }
+  void setPartialgraphs(const std::shared_ptr<Subgraphs> &partialgraphs) { _partialgraphs = partialgraphs; }
 
 private:
   bool checkOperandsForOperation(const Operation &operation);
@@ -128,6 +129,7 @@ public:
   const std::shared_ptr<Subgraphs> &subgraphs() const { return _subgraphs; }
   std::shared_ptr<Subgraphs> &subgraphs() { return _subgraphs; }
   Layout layout() const { return _layout; }
+  std::shared_ptr<Subgraphs> &partialgraphs() { return _partialgraphs; }
 
   // Topological sort
 public:
@@ -144,6 +146,9 @@ private:
   std::shared_ptr<Subgraphs> _subgraphs;
   // TFLite and circle's default layout is NHWC;
   Layout _layout{Layout::NHWC};
+
+  // Partial Graphs
+  std::shared_ptr<ir::Subgraphs> _partialgraphs;
 };
 
 } // namespace ir

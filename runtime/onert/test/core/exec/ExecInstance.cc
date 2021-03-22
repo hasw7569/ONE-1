@@ -80,7 +80,7 @@ public:
     subgs->push(onert::ir::SubgraphIndex{0}, graph);
     tracing_ctx = std::make_unique<onert::util::TracingCtx>(subgs.get());
     onert::compiler::Compiler compiler{subgs, tracing_ctx.get()};
-    executors = compiler.compile();
+    executors = compiler.compile()[0];
   }
 
 public:
@@ -142,7 +142,7 @@ TEST(ExecInstance, twoCompile)
   subgs->push(onert::ir::SubgraphIndex{0}, graph);
   auto tracing_ctx = std::make_unique<onert::util::TracingCtx>(subgs.get());
   onert::compiler::Compiler compiler{subgs, tracing_ctx.get()};
-  std::shared_ptr<onert::exec::ExecutorMap> executors2 = compiler.compile();
+  std::shared_ptr<onert::exec::ExecutorMap> executors2 = compiler.compile()[0];
   onert::exec::Execution execution2{executors2};
 
   const float exe2_input1_buffer[4] = {2, 1, -2, 0};

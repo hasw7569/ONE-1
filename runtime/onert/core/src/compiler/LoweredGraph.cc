@@ -45,8 +45,8 @@ LoweredGraph::LoweredGraph(const ir::Graph &graph, const CompilerOptions &option
   // set tracing_ctx for copied graph
   if (options.tracing_ctx)
   {
-    auto subgraph_index = options.tracing_ctx->getSubgraphIndex(&graph);
-    options.tracing_ctx->setSubgraphIndex(&_graph, subgraph_index.value());
+    // auto subgraph_index = options.tracing_ctx->getSubgraphIndex(&graph);
+    // options.tracing_ctx->setSubgraphIndex(&_graph, subgraph_index.value());
   }
 
   // Build backend contexts
